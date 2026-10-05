@@ -55,14 +55,14 @@ async def uptime_24h_map(
 _HISTORY_SQL = text(
     """
     WITH bounds AS (
-        SELECT date_bin(:bucket, :start_ts, timestamptz '2000-01-03 00:00:00+00') AS first_bucket,
-               date_bin(:bucket, :end_ts,   timestamptz '2000-01-03 00:00:00+00') AS last_bucket
+        SELECT date_bin(CAST(:bucket AS interval), :start_ts, timestamptz '2000-01-03 00:00:00+00') AS first_bucket,
+               date_bin(CAST(:bucket AS interval), :end_ts,   timestamptz '2000-01-03 00:00:00+00') AS last_bucket
     ),
     series AS (
-        SELECT generate_series(first_bucket, last_bucket, :bucket) AS bucket FROM bounds
+        SELECT generate_series(first_bucket, last_bucket, CAST(:bucket AS interval)) AS bucket FROM bounds
     ),
     agg AS (
-        SELECT date_bin(:bucket, checked_at, timestamptz '2000-01-03 00:00:00+00') AS bucket,
+        SELECT date_bin(CAST(:bucket AS interval), checked_at, timestamptz '2000-01-03 00:00:00+00') AS bucket,
                count(*) AS count,
                count(*) FILTER (WHERE ok) AS ok_count,
                round(avg(response_time_ms)) AS avg_ms,
@@ -104,13 +104,12 @@ async def history_rows(
     window, bucket = PERIODS[period]
     end_ts = utcnow().replace(microsecond=0)
     start_ts = end_ts - window
-    bucket_seconds = int(bucket.total_seconds())
 
     raw = (
         await session.execute(
             _HISTORY_SQL,
             {
-                "bucket": f"{bucket_seconds} seconds",
+                "bucket": bucket,  # timedelta → asyncpg encodes as interval
                 "check_id": check_id,
                 "start_ts": start_ts,
                 "end_ts": end_ts,

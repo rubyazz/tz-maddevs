@@ -15,8 +15,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import random
+import sys
 import time
 from datetime import timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select
 

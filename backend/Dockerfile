@@ -11,6 +11,7 @@ WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY app ./app
 COPY alembic ./alembic
+COPY scripts ./scripts
 COPY alembic.ini entrypoint.sh ./
 ENV PATH="/app/.venv/bin:$PATH" \
     PYTHONUNBUFFERED=1
