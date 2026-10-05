@@ -29,6 +29,22 @@ class CheckInProgress(Exception):
     """Raised when the check is already being executed (claim failed)."""
 
 
+@dataclass(slots=True, frozen=True)
+class CheckJob:
+    """Plain-value snapshot for one dispatched check.
+
+    Deliberately NOT an ORM instance: a detached instance merged into a new
+    session carries its pre-claim snapshot and can clobber concurrent
+    column updates (notably next_run_at) back in time.
+    """
+
+    id: object
+    url: str
+    timeout_seconds: int
+    expected_status: int
+    expected_body: str | None
+
+
 @dataclass(slots=True)
 class Outcome:
     ok: bool

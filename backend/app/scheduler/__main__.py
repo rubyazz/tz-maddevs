@@ -38,24 +38,33 @@ WINDOW_PASS_INTERVAL = 5.0
 
 
 async def run_one(
-    maker: async_sessionmaker, client: httpx.AsyncClient, redis: Redis, check: Check
+    maker: async_sessionmaker,
+    client: httpx.AsyncClient,
+    redis: Redis,
+    job: runner.CheckJob,
 ) -> None:
-    """Execute one claimed check end-to-end; never raises."""
+    """Execute one claimed check end-to-end; never raises.
+
+    The job carries plain values (an ORM instance returned by the claim would
+    be merged into a fresh session with its pre-claim snapshot and clobber
+    next_run_at back in time).
+    """
     try:
         outcome = await runner.perform_http_check(
-            client, check.url, check.timeout_seconds, check.expected_status, check.expected_body
+            client, job.url, job.timeout_seconds, job.expected_status, job.expected_body
         )
         async with maker() as session:
-            merged = await session.merge(check)
-            await runner.process_result(session, redis, merged, outcome)
+            check = await session.get(Check, job.id)
+            if check is not None:
+                await runner.process_result(session, redis, check, outcome)
     except Exception:  # noqa: BLE001 — one broken check must not stop the loop
-        logger.exception("check %s (%s) failed to process", check.id, check.name)
+        logger.exception("check %s failed to process", job.id)
     finally:
         try:
             async with maker() as session:
-                await runner.release_check(session, check.id)
+                await runner.release_check(session, job.id)
         except Exception:  # noqa: BLE001
-            logger.exception("failed to release claim for check %s", check.id)
+            logger.exception("failed to release claim for check %s", job.id)
 
 
 async def _renew_forever(lock) -> None:
@@ -124,7 +133,14 @@ async def main() -> None:
                     )
                     if claimed is None:
                         continue  # someone is already running it
-                    task = asyncio.create_task(run_one(maker, client, redis, claimed))
+                    job = runner.CheckJob(
+                        id=claimed.id,
+                        url=claimed.url,
+                        timeout_seconds=claimed.timeout_seconds,
+                        expected_status=claimed.expected_status,
+                        expected_body=claimed.expected_body,
+                    )
+                    task = asyncio.create_task(run_one(maker, client, redis, job))
                     tasks.add(task)
                     task.add_done_callback(tasks.discard)
 
