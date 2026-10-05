@@ -14,7 +14,7 @@ type Mode = (typeof MODES)[number];
 
 export default function DemoPage() {
   const queryClient = useQueryClient();
-  const [modes, setModes] = useState<Record<string, Mode | undefined>>({});
+  const [modes, setModes] = useState<Record<string, { mode: Mode; delay_ms?: number } | undefined>>({});
   const [delayMs, setDelayMs] = useState(12000);
   const [busy, setBusy] = useState<string | null>(null);
 
@@ -67,7 +67,7 @@ export default function DemoPage() {
                 <p className="font-semibold">/{site}</p>
                 <p className="text-xs text-ink-muted">
                   current mode:{' '}
-                  <span className="text-ink-secondary">{modes[site] ?? '…'}</span>
+                  <span className="text-ink-secondary">{modes[site]?.mode ?? '…'}</span>
                 </p>
               </div>
             </div>
@@ -75,7 +75,7 @@ export default function DemoPage() {
               {MODES.map((mode) => (
                 <Button
                   key={mode}
-                  variant={modes[site] === mode ? 'primary' : 'ghost'}
+                  variant={modes[site]?.mode === mode ? 'primary' : 'ghost'}
                   disabled={busy === site}
                   onClick={() => setMode(site, mode)}
                   className="px-2.5 py-1 text-xs"

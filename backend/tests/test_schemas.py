@@ -1,13 +1,11 @@
 """Schema validation tests (pydantic-level, no DB)."""
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from pydantic import ValidationError
 
 from app.schemas import CheckIn, MaintenanceIn
-
-UTC = timezone.utc
 
 
 class TestCheckIn:

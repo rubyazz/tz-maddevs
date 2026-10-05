@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -19,7 +19,7 @@ from app.config import settings
 
 def utcnow() -> datetime:
     """Aware UTC now — the only clock the domain uses."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class Base(DeclarativeBase):

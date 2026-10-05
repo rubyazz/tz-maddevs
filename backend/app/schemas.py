@@ -200,7 +200,7 @@ class MaintenanceIn(BaseModel):
     _tz_ends = field_validator("ends_at", mode="after")(_require_tz)
 
     @model_validator(mode="after")
-    def _exactly_one_target_and_order(self) -> "MaintenanceIn":
+    def _exactly_one_target_and_order(self) -> MaintenanceIn:
         if (self.check_id is None) == (self.group_id is None):
             raise ValueError("exactly one of check_id / group_id must be set")
         if self.ends_at <= self.starts_at:

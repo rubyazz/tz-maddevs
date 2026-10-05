@@ -18,3 +18,13 @@ ENV PATH="/app/.venv/bin:$PATH" \
 RUN chmod +x entrypoint.sh
 EXPOSE 8000
 ENTRYPOINT ["./entrypoint.sh"]
+
+# Test stage: dev dependencies + sources; runs pytest (see compose `test` profile)
+FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS test
+WORKDIR /app
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-install-project
+COPY . .
+ENV PATH="/app/.venv/bin:$PATH"
+CMD ["pytest", "-q"]

@@ -12,9 +12,9 @@ from dataclasses import dataclass
 from datetime import timedelta
 
 import httpx
+from redis.asyncio import Redis
 from sqlalchemy import or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
-from redis.asyncio import Redis
 
 from app import email as email_mod
 from app import events

@@ -1,6 +1,6 @@
 """Email building/deliver tests (in-memory models, no DB)."""
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from uuid import uuid4
 
 from app import email as email_mod
@@ -22,7 +22,7 @@ def _fixtures():
     check = Check(
         id=uuid4(), group_id=group.id, name="Main site", url="http://demo-sites:8090/site/main"
     )
-    started = datetime(2026, 10, 6, 10, 0, tzinfo=timezone.utc)
+    started = datetime(2026, 10, 6, 10, 0, tzinfo=UTC)
     incident = Incident(id=uuid4(), check_id=check.id, started_at=started, last_error="timeout after 10s")
     return group, check, incident
 
@@ -37,7 +37,7 @@ async def test_down_email_content():
 
 async def test_up_email_content():
     group, check, incident = _fixtures()
-    incident.ended_at = datetime(2026, 10, 6, 10, 7, tzinfo=timezone.utc)
+    incident.ended_at = datetime(2026, 10, 6, 10, 7, tzinfo=UTC)
     subject, body = email_mod.build_up_email(check, group, incident)
     assert subject == "[Pulse] UP: Main site"
     assert "7 min" in body

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 from app.checks.logic import group_status
 from app.models import Check, EmailOutbox, Group, Incident, MaintenanceWindow
+from app.queries import PERIODS
 from app.schemas import (
     CheckDetailOut,
     CheckOut,
@@ -13,8 +16,6 @@ from app.schemas import (
     MailboxItem,
     MaintenanceOut,
 )
-from app.queries import PERIODS
-from datetime import timedelta
 
 
 def incident_brief(incident: Incident | None) -> IncidentBrief | None:

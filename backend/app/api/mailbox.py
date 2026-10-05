@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db
 from app.models import EmailOutbox, User
-from app.schemas import MailboxItem
 from app.serializers import mailbox_item
 
 router = APIRouter(prefix="/mailbox", tags=["mailbox"])

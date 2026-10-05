@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
-
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.checks import runner
 from app.api.deps import get_current_user, get_db, get_owned_check, get_redis
+from app.checks import runner
 from app.db import utcnow
 from app.models import Check, Group, Incident, User
 from app.queries import PERIODS, history_rows, incidents_in_window, open_incident_map, uptime_24h_map
@@ -22,7 +20,6 @@ from app.schemas import (
     HistoryBucket,
     HistoryOut,
     HistorySummary,
-    IncidentOut,
     ResultsOut,
 )
 from app.serializers import check_to_detail, check_to_out, incident_to_out
@@ -166,8 +163,8 @@ async def run_check(
         updated = await runner.run_check_now(
             session, request.app.state.http_client, redis, check.id
         )
-    except runner.CheckInProgress:
-        raise HTTPException(status.HTTP_409_CONFLICT, "Check is already running")
+    except runner.CheckInProgress as exc:
+        raise HTTPException(status.HTTP_409_CONFLICT, "Check is already running") from exc
     open_incident = await runner.get_open_incident(session, updated.id)
     uptime = (await uptime_24h_map(session, [updated.id])).get(updated.id)
     return check_to_out(updated, open_incident, uptime)
@@ -225,8 +222,9 @@ async def get_results(
     pair: tuple[Check, Group] = Depends(get_owned_check),
     session: AsyncSession = Depends(get_db),
 ) -> ResultsOut:
-    from app.models import CheckResult
     from datetime import datetime as _dt
+
+    from app.models import CheckResult
 
     stmt = (
         select(CheckResult)

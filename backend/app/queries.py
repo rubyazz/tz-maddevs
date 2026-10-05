@@ -9,7 +9,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import utcnow
-from app.models import Check, CheckResult, Group, Incident
+from app.models import CheckResult, Incident
 
 # period → (window length, bucket size) — CONTRACT §3.7
 PERIODS: dict[str, tuple[timedelta, timedelta]] = {

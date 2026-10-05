@@ -67,8 +67,16 @@ async def seed(checks: list[Check], days: int, interval: int, rng: random.Random
                             checked_at=checked_at,
                             ok=False,
                             status_code=None,
-                            response_time_ms=int(rng.gauss(10_000, 500)) if check.timeout_seconds >= 10 else check.timeout_seconds * 1000,
-                            error=f"timeout after {check.timeout_seconds}s" if rng.random() < 0.8 else "ConnectError: connection refused",
+                            response_time_ms=(
+                                int(rng.gauss(10_000, 500))
+                                if check.timeout_seconds >= 10
+                                else check.timeout_seconds * 1000
+                            ),
+                            error=(
+                                f"timeout after {check.timeout_seconds}s"
+                                if rng.random() < 0.8
+                                else "ConnectError: connection refused"
+                            ),
                         )
                     )
                 if len(rows) >= 5_000:
