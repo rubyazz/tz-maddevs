@@ -8,7 +8,7 @@ services:
       POSTGRES_PASSWORD: pulse
       POSTGRES_DB: pulse
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:15432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -39,7 +39,9 @@ services:
       retries: 20
 
   api:
-    build: ./backend
+    build:
+      context: ./backend
+      target: runtime
     environment: &backend_env
       DATABASE_URL: postgresql+asyncpg://pulse:pulse@db:5432/pulse
       REDIS_URL: redis://redis:6379/0
@@ -63,7 +65,9 @@ services:
       retries: 20
 
   scheduler:
-    build: ./backend
+    build:
+      context: ./backend
+      target: runtime
     entrypoint: ["./entrypoint.sh", "scheduler"]
     environment:
       <<: *backend_env
@@ -80,6 +84,18 @@ services:
     build: ./demo-sites
     ports:
       - "8090:8090"
+
+  test:
+    build:
+      context: ./backend
+      target: test
+    environment:
+      DATABASE_URL: postgresql+asyncpg://pulse:pulse@db-test:5432/pulse_test
+      TEST_DATABASE_URL: postgresql+asyncpg://pulse:pulse@db-test:5432/pulse_test
+    depends_on:
+      db-test:
+        condition: service_healthy
+    profiles: ["test"]
 
   frontend:
     build: ./frontend

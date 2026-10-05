@@ -6,7 +6,7 @@ COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv uv sync --frozen --no-install-project --no-dev
 
 # Runtime stage: slim python + the prepared venv + application code
-FROM python:3.12-slim-bookworm
+FROM python:3.12-slim-bookworm AS runtime
 WORKDIR /app
 COPY --from=builder /app/.venv /app/.venv
 COPY app ./app
