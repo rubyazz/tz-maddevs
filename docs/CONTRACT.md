@@ -1,465 +1,106 @@
-# CONTRACT — Pulse, монитор доступности сайтов
+# CONTRACT — Pulse
 
-Единственный источник правды для backend, frontend, тестов и инфраструктуры.
-Расхождения с этим документом — баг. Изменения контракта — только через
-обновление этого файла + запись в DECISIONS.md.
+Источник правды для backend/frontend/тестов. Расхождение с ним — баг.
+Схема БД canonically живёт в `backend/app/models.py` + миграции
+`alembic/versions/0001_initial.py`; ниже — только правила.
 
-## 1. Архитектура
+## Архитектура
 
-```
-┌────────────┐   HTTP/JSON    ┌────────────┐    SQL     ┌────────────┐
-│  frontend  │ ─────────────▶ │   api      │ ─────────▶ │ PostgreSQL │
-│ (React/TS, │ ◀───────────── │ (FastAPI,  │            │    16      │
-│  nginx)    │  SSE /events   │  uvicorn)  │            └────────────┘
-└────────────┘                └─────┬──────┘
-         │  /status/:slug  SSE            ▲ publish/subscribe (pub/sub)
-         ▼                                │            ┌────────────┐
-   ┌────────────┐        publish          │            │   Redis 7  │
-   │  public    │◀────────────────────────┴────────────│  (pub/sub, │
-   │  (no auth) │                                     │  locks)    │
-   └────────────┘                                     └─────┬──────┘
-                                                      subscribe
-        HTTP-проверки сайтов                          ┌─────┴──────┐
-   ┌────────────┐        ────────── httpx ──────────▶ │ scheduler  │
-   │ demo-sites │◀─────────────────────────────────── │ (asyncio)  │
-   │ (emulator) │        POST /mode/{name} (UI)       └────────────┘
-   └────────────┘
-```
+frontend (nginx :8080, SPA + прокси /api) → api (FastAPI :8000) ⇄ PostgreSQL 16
+(хост :15432) · Redis 7 (pub/sub события, leader-lock) · scheduler (тот же
+образ, `python -m app.scheduler`) · demo-sites (:8090). Публичная страница —
+без auth.
 
-Процессы (docker compose services):
+## Доменные правила (ядро корректности)
 
-| Сервис      | Назначение                                   | Порт (host)      |
-|-------------|----------------------------------------------|------------------|
-| `frontend`  | nginx отдаёт SPA и проксирует `/api` → api    | 8080             |
-| `api`       | FastAPI (uvicorn), REST + SSE, миграции, сид | 8000             |
-| `scheduler` | тот же образ, точка входа `python -m app.scheduler` | —          |
-| `db`        | PostgreSQL 16                                 | 127.0.0.1:5432   |
-| `redis`     | Redis 7                                       | внутренний       |
-| `demo-sites`| эмулятор проверяемых сайтов                   | 8090             |
-| `db-test`   | PostgreSQL для pytest (профиль `test`)        | —                |
+1. **Проверка**: GET url, timeout=timeout_seconds, follow_redirects.
+   Успех = код == expected_status И (expected_body null ИЛИ подстрока в теле).
+   Всё остальное — неудача с человекочитаемым error; response_time_ms — всегда.
+2. **Claim**: перед выполнением атомарно
+   `UPDATE checks SET in_flight_until = now()+timeout+10s WHERE id=? AND paused=false
+   AND (in_flight_until IS NULL OR in_flight_until<=now()) RETURNING *`;
+   0 строк → пропуск. После — NULL. Работает между процессами, самолечится.
+3. **Результат (одна транзакция)**: insert check_results; обновить last_*;
+   неудача: failures+1, при 1-й — failing_since=now; успех: failures=0.
+   state='down' при failures≥threshold, 'up' на успехе. Инциденты:
+   - нет открытого и порог достигнут → создать (started_at=failing_since);
+     не в окне → DOWN-письмо (notified_down_at), иначе suppressed-строка;
+   - открытый и notified_down_at IS NULL и не в окне → DOWN-письмо
+     (путь «окно кончилось, сайт лежит»);
+   - открытый и успех → закрыть (ended_at); не в окне → UP-письмо.
+   Событие `check.update` (+`incident.opened/closed`) в Redis pub/sub.
+4. **Окно обслуживания** (на проверку ИЛИ группу): проверки идут,
+   инциденты пишутся, письма suppressed. Проход шедулера каждые ~5с:
+   открытые инциденты с notified_down_at IS NULL и уже не в окне → DOWN.
+5. **Шедулер**: тик 1с; due = `not paused AND next_run_at<=now`; claim
+   одновременно ставит `next_run_at = now + interval` (слоты не
+   навёрстываются, самопараллельность исключена). Пауза — не выбирается;
+   резюм — next_run_at=now. Рестарт — расписание из БД; простой = дыра.
+   Leader-lock Redis (потеря — немедленный exit). Суточно: чистка
+   результатов старше RESULTS_RETENTION_DAYS (90).
+6. **Статус группы** (вычисляемый, по непаузенным): есть down → major если
+   все, иначе partial; иначе unknown → degraded, иначе operational.
+7. **История**: date_bin-бакеты: day→5м, week→1ч, month→6ч. Бакет: count,
+   ok_count, uptime_ratio (null при 0), avg/max response_ms. Дыры = count 0.
+8. **Письма**: адреса = alert_emails группы (нет адресов → noreply@pulse.local
+   с пометкой). Тема `[Pulse] DOWN|UP: {name}`. Транспорт: SMTP_HOST задан →
+   aiosmtplib, иначе статус sent в outbox.
 
-## 2. Схема БД (PostgreSQL, всё UTC/timestamptz)
+## API (`/api`, Bearer JWT; чужое = 404; даты ISO 8601 UTC)
 
-```sql
-users(
-  id uuid pk default gen_random_uuid(),
-  email text not null unique,              -- хранится в lower()
-  password_hash text not null,             -- argon2
-  created_at timestamptz not null default now()
-)
-
-groups(                                     -- «группа проверок»
-  id uuid pk default gen_random_uuid(),
-  owner_id uuid not null references users(id) on delete cascade,
-  name text not null check (char_length(name) between 1 and 100),
-  description text not null default '',
-  public_slug text unique,                  -- null = группы нет на публичной странице
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-)
-
-alert_emails(                               -- адреса оповещений, свои на группу
-  id uuid pk default gen_random_uuid(),
-  group_id uuid not null references groups(id) on delete cascade,
-  email text not null,
-  created_at timestamptz not null default now(),
-  unique (group_id, email)
-)
-
-checks(
-  id uuid pk default gen_random_uuid(),
-  group_id uuid not null references groups(id) on delete cascade,
-  name text not null check (char_length(name) between 1 and 100),
-  url text not null,                        -- http/https, валидируется
-  interval_seconds int not null check (interval_seconds between 30 and 3600),
-  timeout_seconds int not null check (timeout_seconds between 1 and 30),
-  expected_status int not null default 200,
-  expected_body text,                       -- null = не проверять подстроку
-  failure_threshold int not null default 3 check (failure_threshold between 1 and 10),
-  paused bool not null default false,
-  show_on_public bool not null default false,
-  -- домен, обновляется шедулером:
-  state text not null default 'unknown' check (state in ('unknown','up','down')),
-  consecutive_failures int not null default 0,
-  failing_since timestamptz,                -- первая неудача текущей серии
-  last_checked_at timestamptz,
-  next_run_at timestamptz,                  -- расписание, переживает рестарт
-  in_flight_until timestamptz,              -- claim от параллельного самозапуска
-  -- денормализованный последний результат:
-  last_ok bool,
-  last_status_code int,
-  last_response_time_ms int,
-  last_error text,
-  created_at timestamptz not null default now(),
-  updated_at timestamptz not null default now()
-)
--- индексы:
---   ix_checks_due      on checks(next_run_at) where not paused
---   ix_checks_group    on checks(group_id)
-
-check_results(
-  id bigint generated always as identity pk,
-  check_id uuid not null references checks(id) on delete cascade,
-  checked_at timestamptz not null default now(),
-  ok bool not null,
-  status_code int,
-  response_time_ms int,                     -- замер всегда, даже при ошибке сети
-  error text
-)
--- индекс ix_results_check_time on check_results(check_id, checked_at desc)
-
-incidents(
-  id uuid pk default gen_random_uuid(),
-  check_id uuid not null references checks(id) on delete cascade,
-  started_at timestamptz not null,          -- = failing_since серии
-  ended_at timestamptz,                     -- null = открыт
-  notified_down_at timestamptz,             -- когда ушло (или отмечено suppressed) down-письмо
-  notified_up_at timestamptz,
-  last_error text
-)
---   ix_incidents_check on incidents(check_id, started_at desc)
---   ix_incidents_open  on incidents(check_id) where ended_at is null
-
-maintenance_windows(
-  id uuid pk default gen_random_uuid(),
-  owner_id uuid not null references users(id) on delete cascade,
-  check_id uuid references checks(id) on delete cascade,   -- ровно одна
-  group_id uuid references groups(id) on delete cascade,   -- из двух целей
-  starts_at timestamptz not null,
-  ends_at timestamptz not null check (ends_at > starts_at),
-  note text not null default '',
-  created_at timestamptz not null default now(),
-  check (num_nonnulls(check_id, group_id) = 1)
-)
---   ix_maintenance_active on maintenance_windows(starts_at, ends_at)
-
-email_outbox(                               -- эмуляция почты (и журнал suppressed)
-  id uuid pk default gen_random_uuid(),
-  owner_id uuid not null references users(id) on delete cascade,
-  group_id uuid references groups(id) on delete cascade,
-  check_id uuid references checks(id) on delete cascade,
-  to_email text not null,
-  subject text not null,
-  body text not null,
-  kind text not null check (kind in ('down','up','test')),
-  status text not null check (status in ('sent','suppressed')),
-  suppress_reason text,                     -- например 'maintenance_window'
-  created_at timestamptz not null default now()
-)
-```
-
-## 3. Доменные правила (ядро корректности)
-
-### 3.1 Выполнение проверки
-
-`perform_http_check`: GET `url`, `timeout = timeout_seconds` (httpx connect+
-read+write+pool), follow_redirects=true. Успех = `status_code == expected_status`
-И (`expected_body is null` ИЛИ подстрока в теле). Всё остальное (таймаут,
-ошибка сети, не тот код, нет подстроки) = неудача; `error` — человекочитаемая
-строка. `response_time_ms` — целое, замеряется всегда.
-
-### 3.2 Claim: проверка не запускается параллельно сама с собой
-
-Перед выполнением (и шедулером, и ручным «запустить сейчас»):
-
-```sql
-UPDATE checks SET in_flight_until = now() + (timeout_seconds + 10) * interval '1 sec'
-WHERE id = :id AND paused = false
-  AND (in_flight_until IS NULL OR in_flight_until <= now())
-RETURNING id;
-```
-
-0 строк → кто-то уже выполняет, пропускаем. После завершения
-`in_flight_until = NULL`. Протухший claim самолечится по времени.
-
-### 3.3 Обработка результата (одна транзакция)
-
-1. insert `check_results`;
-2. обновить `last_*`, `last_checked_at`;
-3. неудача: `consecutive_failures += 1`; если стала 1 — `failing_since = now`.
-   Успех: `consecutive_failures = 0`, `failing_since = NULL`;
-4. состояние: `state='down'` когда `consecutive_failures >= failure_threshold`;
-   `state='up'` на успехе; до порога при неудачах остаётся прежним (`up`);
-5. инциденты:
-   - нет открытого И порог достигнут → создать incident
-     (`started_at = failing_since`, `last_error`), событие `incident.opened`;
-     если НЕ в окне обслуживания → down-письмо (один раз, `notified_down_at`),
-     иначе записать suppressed-строку в outbox (без `notified_down_at`);
-   - открытый И `notified_down_at IS NULL` И сейчас НЕ в окне → отправить
-     down-письмо (этот путь закрывает «окно кончилось, сайт всё ещё лежит»);
-   - открытый И успех → `ended_at = now`, событие `incident.closed`;
-     если НЕ в окне → up-письмо (`notified_up_at`), иначе suppressed-строка;
-6. событие `check.update` (см. §5).
-
-### 3.4 Окно обслуживания
-
-Действует, если существует окно с `(check_id = :check OR group_id = :group)
-AND starts_at <= now() < ends_at`. В окно: проверки идут, результаты и
-инциденты пишутся, письма подавляются (suppressed-строки видны в Mailbox).
-Проход шедулера `window_end_notification_pass` (каждые ~5с): открытые
-инциденты с `notified_down_at IS NULL` и уже НЕ в окне → отправить down.
-
-### 3.5 Шедулер
-
-Одноинтервальный asyncio-цикл (тик 1с): выбрать due-проверки
-(`not paused AND next_run_at <= now`), для каждой — claim; при успехе сразу
-`next_run_at = now + interval_seconds` и запустить задачу. Пропущенные по
-перегрузке/простою слоты не навёрстываются. Пауза: не выбирается; резюм:
-`next_run_at = now`. Рестарт: расписание читается из БД, простои не создают
-результатов (дыры в истории), инциденты не создаются. Leader-lock Redis
-`scheduler:leader` (SET NX PX, пролонгация), второй экземпляр завершается.
-Ежесуточно: удаление `check_results` старше `RESULTS_RETENTION_DAYS` (90).
-
-### 3.6 Статус группы (вычисляемый)
-
-По непоставленным на паузу проверкам группы: есть down →
-`major_outage` если down все, иначе `partial_outage`; нет down, но есть
-`unknown` → `degraded`; иначе `operational`. Все на паузе → `maintenance`?
-
-Нет: `paused` не влияет — только up/down/unknown. Группа без активных
-проверок → `operational`.
-
-### 3.7 История (агрегация на лету)
-
-`GET /api/checks/{id}/history?period=day|week|month`:
-бакеты `date_bin`: day → 5 мин, week → 1 час, month → 6 часов. На бакет:
-`count`, `ok_count`, `uptime_ratio = ok_count/count` (null если 0),
-`avg_response_ms`, `max_response_ms`. Плюс `summary` за весь период и список
-инцидентов, пересекающихся с периодом. Дыры (нет данных) — бакеты с
-`count = 0`, `uptime_ratio = null`.
-
-### 3.8 Письма
-
-Одно `down` на инцидент, одно `up` на закрытие. Адреса — `alert_emails`
-группы; если у группы адресов нет — письмо пишется в outbox на
-`noreply@pulse.local` с пометкой в теле (доказуемо в UI). Тема:
-`[Pulse] DOWN: {check.name}` / `[Pulse] UP: {check.name}`. Транспорт: если
-задан `SMTP_HOST` — aiosmtplib, иначе статус `sent` в outbox (эмуляция).
-
-## 4. REST API
-
-Авторизация: `Authorization: Bearer <jwt>`; JWT HS256, `sub=user_id`,
-`exp = 24h`. Ошибки: `{"detail": "..."}` + правильные коды (401/403/404/409/422).
-Все ресурсы скоуплены по владельцу (owner) — чужое = 404.
-
-Базовый префикс `/api`. Формат дат — ISO 8601 UTC.
-
-### Auth
-```
-POST /api/auth/register {email, password(>=8)}        → 201 {token, user:{id,email}}
-POST /api/auth/login    {email, password}             → 200 {token, user:{id,email}}
-GET  /api/me                                           → 200 user
-```
-
-### Overview (дашборд)
-```
-GET /api/overview → 200 {
-  groups: [{
-    id, name, description, public_slug, status,            // §3.6
-    alert_emails: [{id, email}],
-    checks: [CheckView]                                    // §CheckView, по created_at
-  }]
-}
-```
-
-**CheckView** (используется везде, где есть проверка):
-```
-{ id, group_id, name, url, interval_seconds, timeout_seconds, expected_status,
-  expected_body, failure_threshold, paused, show_on_public, state,
-  consecutive_failures, last_checked_at, last_ok, last_status_code,
-  last_response_time_ms, last_error,
-  open_incident: {id, started_at} | null,                 // текущее падение
-  uptime_24h: number|null }                                // ok/total за 24ч
-```
-
-### Groups
-```
-POST   /api/groups {name, description?}                        → 201 GroupView
-GET    /api/groups                                            → [GroupView без checks]
-PATCH  /api/groups/{id} {name?, description?, public_slug?}    → GroupView
-        public_slug: null — убрать с публички; "" — нельзя; строка — задать
-        (валидация: 3-64, [a-z0-9-], уникальность → 409)
-DELETE /api/groups/{id}                                       → 204
-POST   /api/groups/{id}/emails {email}                        → 201 {id, email}
-DELETE /api/groups/{id}/emails/{email_id}                     → 204
-POST   /api/groups/{id}/public-slug/generate                  → 200 {public_slug}
-```
-
-### Checks
-```
-POST   /api/checks {group_id, name, url, interval_seconds, timeout_seconds,
-                    expected_status?, expected_body?, failure_threshold?,
-                    show_on_public?}                           → 201 CheckView
-GET    /api/checks?group_id=&paused=                          → [CheckView]
-GET    /api/checks/{id}                                       → 200 CheckDetail
-PATCH  /api/checks/{id}  {любые поля, вкл. paused}            → 200 CheckView
-DELETE /api/checks/{id}                                       → 204
-POST   /api/checks/{id}/run                                   → 200 CheckView  // ручной запуск сейчас
-GET    /api/checks/{id}/history?period=                       → §3.7
-GET    /api/checks/{id}/results?limit<=200&before=<iso>       → {items:[CheckResult], next_before|null}
-POST   /api/checks/{id}/pause | /resume                       → 200 CheckView  // sugar для PATCH paused
-```
-`CheckResult`: `{id, checked_at, ok, status_code, response_time_ms, error}`.
-При создании/резюме: `next_run_at = now`, `state` не сбрасывается.
-Смена `interval/timeout` применяется со следующего запуска.
-
-`CheckDetail` = CheckView + `incidents: [{id, started_at, ended_at, duration_s|null, last_error}]` (последние 50) + `group: {id, name}`.
-
-### Maintenance
-```
-GET    /api/maintenance-windows?active=true|false            → [{id, check_id, group_id,
-                                                               starts_at, ends_at, note,
-                                                               check_name|group_name}]
-POST   /api/maintenance-windows {check_id | group_id, starts_at, ends_at, note?} → 201
-PATCH  /api/maintenance-windows/{id} {starts_at?, ends_at?, note?}               → 200
-DELETE /api/maintenance-windows/{id}                                            → 204
-```
-
-### Mailbox (эмуляция почты)
-```
-GET /api/mailbox?limit=100                     → {items: [{id, group_id, check_id, to_email,
-                                                 subject, body, kind, status, suppress_reason,
-                                                 created_at}]}   // новые сверху
-POST /api/groups/{id}/emails/{email_id}/test   → 201 outbox-строка kind=test
-```
-
-### Публичное (без авторизации)
-```
-GET /api/public/{slug} → 200 {
-  group: {name, description},
-  status,                                    // §3.6 по public-проверкам
-  checks: [{id, name, state, last_checked_at, uptime_24h}]   // только show_on_public=true
-} | 404
-GET /api/public/{slug}/events                 → SSE, только события этой группы и только public-проверок
-```
-
-### Служебные
-```
-GET /api/health → {"status":"ok", "scheduler_heartbeat": <iso|null>}
-```
-`scheduler_heartbeat` — ключ в Redis `scheduler:heartbeat` (TTL 10с), пишется каждым тиком.
-
-## 5. SSE
-
-`GET /api/events?token=<jwt>` (EventSource заголовки не умеет — token в query).
-Ответ `text/event-stream`; `retry: 3000`; heartbeat `: ping` каждые 15с.
-
-События (имя события = поле `type`):
-
-```
-event: check.update
-data: {"type":"check.update","check_id":"…","group_id":"…","owner_id":"…",
-       "state":"up|down|unknown","ok":true,"status_code":200,
-       "response_time_ms":123,"checked_at":"…","paused":false,
-       "consecutive_failures":0,"failure_threshold":3,
-       "show_on_public":true,"public_slug":"demo-status|null"}
-
-event: incident.opened
-data: {"type":"incident.opened","incident_id":"…","check_id":"…","group_id":"…",
-       "owner_id":"…","started_at":"…","last_error":"…","show_on_public":…,"public_slug":…}
-
-event: incident.closed
-data: {"type":"incident.closed","incident_id":"…","check_id":"…","group_id":"…",
-       "owner_id":"…","started_at":"…","ended_at":"…","show_on_public":…,"public_slug":…}
-```
-
-Семантика для клиента: любое событие → invalidate `['overview']`,
-`['check', check_id]`, `['history', check_id]`, `['mailbox']`; для публичного
-потока — invalidate `['public', slug]`. Сервер фильтрует: `/api/events` —
-только события владельца токена; `/api/public/{slug}/events` — только
-`show_on_public=true` и `public_slug == slug`.
-
-## 6. Эмулятор demo-sites
-
-```
-GET  /ok                       → 200 "OK"
-GET  /slow/{ms}                → спит ms, 200 "OK"
-GET  /error                    → 500 "Internal Server Error"
-GET  /hang                     → не отвечает никогда
-GET  /flaky/{n}                → каждый n-й запрос 500
-GET  /site/{name}              → ответ по текущему режиму name
-POST /mode/{name} {mode}       → установить режим: "ok"|"error"|"dead"|"slow"|"flaky"
-                               + optional {"delay_ms": 5000} для slow
-GET  /modes                    → {name: mode} — все текущие режимы
-GET  /healthz
-```
-Режимы: `ok` → 200 "OK from {name}"; `error` → 500; `dead` → висит (не
-отвечает до таймаута клиента); `slow` → спит `delay_ms` (default 10000) → 200;
-`flaky` → каждый 2-й запрос 500. Состояние в памяти процесса. CORS: allow all
-(демо-сервис). Проверяемые URL из сида: `http://demo-sites:8090/site/<name>`.
-
-## 7. Env
-
-```
-DATABASE_URL=postgresql+asyncpg://pulse:pulse@db:5432/pulse
-REDIS_URL=redis://redis:6379/0
-JWT_SECRET=change-me                    # обязателен в prod
-SEED_DEMO=1                             # сид demo-данных при старте api (идемпотентно)
-CORS_ORIGINS=http://localhost:8080
-SMTP_HOST= SMTP_PORT=25 SMTP_USER= SMTP_PASSWORD= MAIL_FROM=pulse@localhost   # пусто = эмуляция
-RESULTS_RETENTION_DAYS=90
-SCHEDULER_TICK_SECONDS=1.0
-LOG_LEVEL=INFO
-```
-
-## 8. Seed (SEED_DEMO=1, идемпотентно)
-
-- user `demo@pulse.dev` / `demo1234`;
-- группа `Production` (slug `demo-status`, email `demo@pulse.dev`):
-  - «Main site» → site/main, 60с, таймаут 10с, порог 3, public;
-  - «Slow API» → site/slow, 60с, таймаут 5с, порог 2, public (режим slow c delay 3000 — отвечает, но медленно);
-  - «Flaky endpoint» → site/flaky, 30с, таймаут 10с, порог 3;
-- группа `Internal` (без публичности, email нет):
-  - «Legacy service» → site/dead, 60с, таймаут 10с, порог 3;
-- окно обслуживания: группа Internal, завтра 02:00–04:00 UTC, note «DB upgrade»;
-- начальные режимы эмулятора: main=ok, slow=slow(3000), flaky=ok, dead=ok.
-
-## 9. Design direction (frontend)
-
-Продукт — ops-инструмент: спокойный, плотный, информационный. Тёмная тема
-по умолчанию (переключатель не обязателен). Шрифт — системный стек
-`system-ui, -apple-system, "Segoe UI", sans-serif`. Дизайн-токены (hex, не
-имена Tailwind — использовать ровно эти значения):
-
-| Роль | Значение |
+| Метод и путь | Назначение |
 |---|---|
-| Фон страницы | `#020617` |
-| Поверхность карточки/графика | `#0f172a` |
-| Хайрлайн-рамка | `rgba(255,255,255,0.08)` |
-| Ink primary / secondary / muted | `#f1f5f9` / `#94a3b8` / `#64748b` |
-| Gridline (1px solid, recessive) | `#1e293b` |
-| Ось (линия) | `#334155` |
-| Статус `up` (good) | `#0ca30c` |
-| Статус `down` (critical) | `#d03b3b` |
-| Статус `paused` (warning) | `#fab219` |
-| Статус `unknown` | `#64748b` |
-| Обслуживание / info-акцент | `#3987e5` |
-| Единственная серия линии графика | `#3987e5` (2px, round join/cap) |
-| Availability-бар: ratio=1 | `#0ca30c` |
-| Availability-бар: 0<ratio<1 | `#ec835a` |
-| Availability-бар: ratio=0 | `#d03b3b` |
-| Availability-бар: дыра (null) | пусто (цвет поверхности) |
+| POST /auth/register, /auth/login | {token, user}; GET /me |
+| GET /overview | группы + статус + checks + alert_emails (снапшот дашборда) |
+| POST/GET /groups; PATCH/DELETE /groups/{id} | public_slug: null=снять, строка 3–64 [a-z0-9-] (409 при занятости) |
+| POST/DELETE /groups/{id}/emails[/{email_id}] | адреса оповещений; POST …/emails/{id}/test — тестовое письмо |
+| POST /groups/{id}/public-slug/generate | негадаемый slug |
+| POST/GET /checks; GET/PATCH/DELETE /checks/{id} | валидация: interval 30–3600, timeout 1–30, threshold 1–10; PATCH paused=false → next_run_at=now |
+| POST /checks/{id}/run · /pause · /resume | ручной запуск (409 если пауза/уже выполняется) |
+| GET /checks/{id}/history?period=day\|week\|month | §7 + summary (uptime, avg, p95) + инциденты периода |
+| GET /checks/{id}/results?limit≤200&before= | сырые результаты, курсорная пагинация |
+| GET/POST/PATCH/DELETE /maintenance-windows | ровно одна цель (check_id XOR group_id), ends>starts, tz-aware |
+| GET /mailbox?limit | outbox (sent/suppressed + причина) |
+| GET /events?token= | SSE (см. ниже) |
+| GET /public/{slug} · /public/{slug}/events | публичная страница: только show_on_public проверки группы |
+| GET /health | ok + scheduler_heartbeat |
 
-Правила: статусный цвет никогда не несёт смысл один — всегда рядом
-иконка/текст (точка ● + подпись). Текст не красится в цвет серии — только
-ink-токены. Одна серия — без легенды (заголовок называет её). Двух осей
-нет: график времени ответа и полоса доступности — два отдельных графика
-друг под другом. Тултип обязателен: на линии — crosshair+value, на барах —
-per-bar. Числа в таблицах и тиках осей — `font-variant-numeric:
-tabular-nums`. Бары ≤24px толщиной, 2px поверхности-зазор между соседними,
-дата-конец 4px скруглён, у базы — квадрат. Маркеры ≥8px с 2px кольцом
-цвета поверхности. Gridline — solid hairline, не dashed.
+## SSE
 
-Ключевые экраны: сайдбар-навигация слева (Dashboard, Maintenance, Mailbox,
-Demo, — и выход); таблица проверок с живыми статусами (точка, имя, URL,
-время ответа, последняя проверка «N мин назад», длительность текущего
-падения, интервал); карточка проверки с графиком ответа (линия) и %
-доступности (число + полоса-бар по бакетам); журнал инцидентов таблицей;
-Mailbox — список писем с бейджами sent/suppressed; публичная страница —
-крупный общий статус-баннер + строки проверок, без навигации приватной
-части. Пустые состояния с подсказкой и CTA. Кнопка «Run now» — с локальным
-состоянием загрузки. Все времена — локальная зона браузера, ISO-парсинг.
+`retry: 3000`, heartbeat `: ping` каждые 15с. События `check.update`,
+`incident.opened`, `incident.closed`; payload включает owner_id,
+show_on_public, public_slug. `/api/events` фильтрует по владельцу токена,
+публичный поток — по slug + show_on_public. Клиент на любое событие
+инвалидирует queries (overview/check/history/results/mailbox/public).
 
-Графики (Recharts): линия времени ответа (мс) по бакетам, дыры = разрывы
-линии (`connectNulls={false}`); доступность — полоса бакетов на 100%-шкале.
-Оси: время (локальное), мс; тултипы с конкретными значениями.
+## demo-sites (:8090, CORS *)
+
+`GET /site/{name}` — ответ по режиму; `POST /mode/{name}` {mode, delay_ms}
+— ok|error|dead(висит)|slow|flaky(каждый 2-й 500); `GET /modes`;
+удобные `/ok /error /hang /slow/{ms} /flaky/{n}`. Состояние в памяти.
+
+## Env
+
+`DATABASE_URL, REDIS_URL, JWT_SECRET, SEED_DEMO, CORS_ORIGINS,
+SMTP_HOST/PORT/USER/PASSWORD/MAIL_FROM (пусто = эмуляция),
+RESULTS_RETENTION_DAYS=90, SCHEDULER_TICK_SECONDS=1, LOG_LEVEL` — см.
+`app/config.py`.
+
+## Seed (SEED_DEMO=1, идемпотентно)
+
+demo@pulse.dev/demo1234 · Production (slug demo-status, email):
+Main site (60с/10с/порог 3, public), Slow API (60с/5с/2, public, slow
+3000мс), Flaky endpoint (30с/10с/3) · Internal: Legacy service (60с/10с/3)
+· окно на Internal завтра 02:00–04:00 UTC · режимы эмулятора: все ok.
+
+## Дизайн-токены (проверены валидатором dataviz)
+
+Фон #020617 · поверхность #0f172a · рамка rgba(255,255,255,0.08) ·
+ink #f1f5f9/#94a3b8/#64748b · gridline #1e293b · ось #334155 ·
+статусы: up #0ca30c, down #d03b3b, paused #fab219, unknown #64748b,
+info/обслуживание #3987e5 · серия линии #3987e5 · availability-бары:
+1→#0ca30c, <1→#ec835a, 0→#d03b3b, дыра→пусто.
+Правила: статусный цвет всегда с подписью; текст — только ink-токены;
+одна серия — без легенды; двух осей нет (линия и полоса — два графика);
+тултипы обязательны; tabular-nums в таблицах/тиках; линия 2px, бары ≤24px
+с 2px зазором; дыры рвут линию (connectNulls=false).
