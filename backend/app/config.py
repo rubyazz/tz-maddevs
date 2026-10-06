@@ -8,7 +8,7 @@ class Settings(BaseSettings):
 
     database_url: str = "postgresql+asyncpg://pulse:pulse@localhost:5432/pulse"
     redis_url: str = "redis://localhost:6379/0"
-    jwt_secret: str = "dev-secret-change-me"
+    jwt_secret: str = "dev-secret-change-me-0123456789abcdef"
     jwt_algorithm: str = "HS256"
     jwt_ttl_seconds: int = 24 * 3600
 
